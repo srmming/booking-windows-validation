@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { atomicJSON, readJSON, acquireLock, generation, inventory, validateSnapshot } = require('../../windows/storage.cjs');
+const { atomicJSON, readJSON, acquireLock, generation, inventory, validateSnapshot, copyTreeExclusive } = require('../../windows/storage.cjs');
 function temp(t) { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'booking-storage-')); t.after(() => fs.rmSync(dir, { force: true, recursive: true })); return dir; }
 async function snapshot(dir) {
   fs.mkdirSync(path.join(dir, 'db')); fs.writeFileSync(path.join(dir, 'db', 'WiredTiger'), 'fixture');
@@ -22,6 +22,19 @@ test('single instance lock blocks concurrent maintenance and releases only its o
   lock.release(); const second = acquireLock(root); second.release();
   atomicJSON(path.join(root, 'operation.lock'), { pid: -1 });
   assert.throws(() => acquireLock(root), /Invalid/);
+});
+test('Unicode snapshot copy preserves bytes and refuses every existing destination', t => {
+  const root = temp(t), source = path.join(root, '中文 source'), target = path.join(root, '中文 copy');
+  fs.mkdirSync(path.join(source, 'nested'), { recursive: true });
+  fs.writeFileSync(path.join(source, 'nested', 'WiredTiger'), Buffer.from([0, 255, 42]));
+  copyTreeExclusive(source, target);
+  assert.deepEqual(fs.readFileSync(path.join(target, 'nested', 'WiredTiger')), Buffer.from([0, 255, 42]));
+  fs.writeFileSync(path.join(target, 'sentinel'), 'preserve');
+  assert.throws(() => copyTreeExclusive(source, target), { code: 'EEXIST' });
+  assert.equal(fs.readFileSync(path.join(target, 'sentinel'), 'utf8'), 'preserve');
+  const existingFile = path.join(root, 'existing'); fs.writeFileSync(existingFile, 'preserve');
+  assert.throws(() => copyTreeExclusive(source, existingFile), { code: 'EEXIST' });
+  assert.equal(fs.readFileSync(existingFile, 'utf8'), 'preserve');
 });
 test('snapshot validation rejects tampered, missing, extra, traversal and version mismatched files', async t => {
   const root = temp(t); const original = await snapshot(root);
