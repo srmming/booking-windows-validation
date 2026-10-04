@@ -84,7 +84,10 @@ jobs:
           function Api([string]$route, [string]$method='GET', $body=$null) {
             $options = @{Uri="http://127.0.0.1:17880/api/$route";Method=$method;TimeoutSec=15}
             if ($null -ne $body) { $options.ContentType='application/json';$options.Body=($body | ConvertTo-Json -Depth 12 -Compress) }
-            Invoke-RestMethod @options
+            $result = Invoke-RestMethod @options
+            # Windows PowerShell emits a JSON array as one pipeline object;
+            # explicitly enumerate it so [] has zero entries in count checks.
+            if ($result -is [array]) { foreach ($item in $result) { $item } } else { $result }
           }
           function Check([bool]$condition,[string]$message) { if (!$condition) { throw $message } }
           try {
