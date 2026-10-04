@@ -25,7 +25,7 @@ jobs:
           Write-Output "OS=$($os.Caption); Build=$($os.BuildNumber); Arch=$env:PROCESSOR_ARCHITECTURE; PS=$($PSVersionTable.PSVersion)"
           if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'Expected x64 runner.' }
           $zip = Join-Path $PWD 'validation\LaBellotita-Booking-Windows-x64-bootstrap.zip'
-          $expected = 'ec25c63509c1916fcce83b1b652baf84480731b68af469782c03d1efca2f46db'
+          $expected = 'a8fecfe1d4705c3377a76939f1ec0fcdd34e660ee3258c147d2094d88cbaf953'
           if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'ZIP differs from reviewed candidate.' }
           $extracted = Join-Path $env:RUNNER_TEMP 'booking 中文 extracted path'
           Write-Output 'Extracting exact application ZIP.'

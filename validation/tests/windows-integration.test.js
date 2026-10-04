@@ -20,6 +20,13 @@ test('real local CRUD, restart persistence, shipment, clean snapshot and non-ove
     const child = spawn(process.execPath, [controller, ...args], { env, stdio: ['ignore','pipe','pipe'] });
     let output = ''; child.stdout.on('data', b => output += b); child.stderr.on('data', b => output += b);
     const code = await new Promise((resolve, reject) => { child.on('exit', resolve); child.on('error', reject); });
+    if (code !== 0) {
+      t.diagnostic('Controller command failed: '+args.join(' ')+'; running output: '+(running?.output || ''));
+      for (const name of ['state.json','operation.lock','stop.json','logs/lifecycle.log','logs/application.log','logs/database-console.log','logs/database.log']) {
+        const file=path.join(root,name);
+        if (fs.existsSync(file)) t.diagnostic(name+': '+fs.readFileSync(file,'utf8').split(/\r?\n/).slice(-30).join('\n'));
+      }
+    }
     assert.equal(code, 0, output); return output.trim();
   }
   async function start() {
@@ -86,6 +93,57 @@ test('real local CRUD, restart persistence, shipment, clean snapshot and non-ove
   assert.equal(await new Promise(resolve=>conflict.on('exit',resolve)),1);
   assert.match(conflictOut,/occupied/);
   await new Promise(resolve=>server.close(resolve));
+});
+
+test('state write failure during stop does not abandon owned application or database', { skip: !executable, timeout: 60000 }, async t => {
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'booking-stop-metadata-'));
+  const preload=path.join(root,'inject.cjs');
+  const storage=path.resolve(__dirname,'../../windows/storage.cjs');
+  fs.writeFileSync(preload,`const s=require(${JSON.stringify(storage)});const original=s.atomicJSON;let once=true;s.atomicJSON=(file,value)=>{if(once&&file.endsWith('state.json')&&value.phase==='stopping'){once=false;const e=new Error('Injected state rename EPERM');e.code='EPERM';throw e;}return original(file,value)};`);
+  const env={...process.env,BOOKING_TEST_MODE:'1',BOOKING_TEST_ROOT:root,BOOKING_TEST_APP_PORT:'23993',BOOKING_TEST_DB_PORT:'23994',BOOKING_TEST_MONGOD:executable};
+  const child=spawn(process.execPath,['--require',preload,controller,'run'],{env,stdio:['ignore','pipe','pipe']});
+  let output='';child.stdout.on('data',b=>output+=b);child.stderr.on('data',b=>output+=b);
+  async function stop() {
+    const stopper=spawn(process.execPath,[controller,'stop'],{env,stdio:['ignore','pipe','pipe']});
+    let text='';stopper.stdout.on('data',b=>text+=b);stopper.stderr.on('data',b=>text+=b);
+    const code=await new Promise((resolve,reject)=>{stopper.once('exit',resolve);stopper.once('error',reject)});
+    assert.equal(code,0,text+'\n'+output);
+  }
+  t.after(async()=>{
+    try { await stop(); }
+    finally {
+      if(child.exitCode===null) child.kill('SIGTERM');
+      if(!fs.existsSync(path.join(root,'operation.lock'))) fs.rmSync(root,{recursive:true,force:true});
+    }
+  });
+  let ready=false;
+  for(let i=0;i<160;i++) {
+    if(child.exitCode!==null) assert.fail(output);
+    try{if(readJSON(path.join(root,'state.json')).phase==='running'){ready=true;break}}catch(_){}
+    await sleep(250);
+  }
+  assert.equal(ready,true,output);
+  await stop();
+  assert.equal(readJSON(path.join(root,'state.json')).phase,'stopped');
+  assert.equal(fs.existsSync(path.join(root,'operation.lock')),false);
+  const {assertPortFree}=require('../../windows/controller.cjs');
+  await assertPortFree(23993);await assertPortFree(23994);
+  const journal=fs.readFileSync(path.join(root,'logs/lifecycle.log'),'utf8');
+  assert.match(journal,/state-stop-warning.*Injected state rename EPERM/);
+  assert.match(journal,/http-child-exited/);assert.match(journal,/mongo-child-exited/);assert.match(journal,/lease-released/);
+});
+
+test('stop reports matching-instance cleanup errors without the generic two-minute timeout', { timeout: 3000 }, async t => {
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'booking-stop-error-'));
+  t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  const {atomicJSON}=require('../../windows/storage.cjs');
+  const {stop}=require('../../windows/controller.cjs');
+  atomicJSON(path.join(root,'operation.lock'),{pid:process.pid,instance:'fixture'});
+  atomicJSON(path.join(root,'state.json'),{phase:'running',instance:'fixture'});
+  const timer=setTimeout(()=>atomicJSON(path.join(root,'state.json'),{phase:'error',instance:'fixture',error:'Fixture HTTP drain failure'}),50);
+  t.after(()=>clearTimeout(timer));
+  await assert.rejects(stop({root}),/Fixture HTTP drain failure/);
+  assert.equal(fs.existsSync(path.join(root,'operation.lock')),true);
 });
 
 test('readiness failure retains the lease until the owned database cleanly exits', { skip: !executable, timeout: 60000 }, async t => {
