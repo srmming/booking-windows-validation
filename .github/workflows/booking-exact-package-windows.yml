@@ -92,7 +92,14 @@ jobs:
           function Check([bool]$condition,[string]$message) { if (!$condition) { throw $message } }
           try {
             Menu 'start'
+            $initialResponse = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:17880/api/customers' -TimeoutSec 15
+            $initialResult = Invoke-RestMethod -Uri 'http://127.0.0.1:17880/api/customers' -TimeoutSec 15
+            Write-Output ("Initial customer JSON: " + $initialResponse.Content)
+            $initialType = if ($null -eq $initialResult) { 'null' } else { $initialResult.GetType().FullName }
+            Write-Output ("Initial REST type=" + $initialType + "; directCount=" + $initialResult.Count)
+            Check ($initialResponse.Content -match '^\s*\[\s*\]\s*$') 'Initial raw customer JSON must be an empty array.'
             $empty = @(Api 'customers')
+            Write-Output ("Enumerated customer count=" + $empty.Count)
             Check ($empty.Count -eq 0) 'Initial customer database is not empty.'
             $config = Api 'config'
             Check (!$config.demo -and !$config.readOnly) 'Installed system is not real writable LAN mode.'
