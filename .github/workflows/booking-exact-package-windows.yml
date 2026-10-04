@@ -1,0 +1,159 @@
+name: Booking exact Windows package - Server 2022
+on:
+  push:
+    branches: [booking-windows-ci-20261004]
+    paths: ['.github/workflows/booking-exact-package-windows.yml', 'validation/**']
+permissions:
+  contents: read
+jobs:
+  verify:
+    if: github.repository == 'srmming/booking-windows-validation'
+    runs-on: windows-2022
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Verify exact ZIP and install pinned runtimes
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $os = Get-CimInstance Win32_OperatingSystem
+          Write-Output "OS=$($os.Caption); Build=$($os.BuildNumber); Arch=$env:PROCESSOR_ARCHITECTURE; PS=$($PSVersionTable.PSVersion)"
+          if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'Expected x64 runner.' }
+          $zip = Join-Path $PWD 'validation\LaBellotita-Booking-Windows-x64-bootstrap.zip'
+          $expected = '9459eb72cf163911d0c47bf54d9cc370e87a96c2dd1df3246b1c28f69fa4d1d5'
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'ZIP differs from reviewed candidate.' }
+          $extracted = Join-Path $env:RUNNER_TEMP 'booking 中文 extracted path'
+          Expand-Archive $zip $extracted
+          $source = Join-Path $extracted 'LaBellotita-Booking-Windows-x64'
+          $menu = Join-Path $source 'windows\menu.ps1'
+          $tokens = $null; $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile($menu,[ref]$tokens,[ref]$errors) > $null
+          if ($errors.Count) { $errors | Format-List; throw 'PowerShell 5.1 parse failed.' }
+          $root = Join-Path $env:LOCALAPPDATA 'LaBellotitaBooking'
+          if (Test-Path $root) { throw 'Refuse an existing installation or data directory.' }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $menu -Action install -NoGui
+          if ($LASTEXITCODE -ne 0) { throw 'Installer failed.' }
+          $app = Join-Path $root 'app'
+          $spec = Get-Content (Join-Path $app 'windows\runtime.json') -Raw | ConvertFrom-Json
+          $node = Join-Path $root "runtime\$($spec.node.directory)\node.exe"
+          $mongo = Join-Path $root "runtime\$($spec.mongo.directory)\bin\mongod.exe"
+          if (!(Test-Path $node) -or !(Test-Path $mongo)) { throw 'Pinned runtime missing.' }
+          foreach ($pair in @{BOOKING_INSTALLED_ROOT=$root;BOOKING_APP=$app;BOOKING_NODE=$node;BOOKING_MONGOD=$mongo}.GetEnumerator()) {
+            "$($pair.Key)=$($pair.Value)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+          $desktop = [Environment]::GetFolderPath('Desktop')
+          $shell = New-Object -ComObject WScript.Shell
+          foreach ($name in @('Start','Stop','Backup','Restore','LAN Addresses')) {
+            $shortcut = $shell.CreateShortcut((Join-Path $desktop "Booking - $name.lnk"))
+            if ($shortcut.Arguments -notlike ('*' + $app + '*')) { throw "Invalid shortcut: $name" }
+          }
+          Write-Output 'Exact ZIP installed; shortcuts created; Node/Mongo downloads verified by installer.'
+      - name: Installed application regression tests with real MongoDB
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tests = Join-Path $env:BOOKING_APP 'backend\tests'
+          New-Item $tests -ItemType Directory | Out-Null
+          Copy-Item 'validation\tests\*.test.js' $tests
+          $env:BOOKING_TEST_MONGOD = $env:BOOKING_MONGOD
+          if (!(Test-Path $env:BOOKING_TEST_MONGOD)) { throw 'Real MongoDB tests must not silently skip.' }
+          $files = @(Get-ChildItem $tests -Filter '*.test.js' | ForEach-Object { $_.FullName })
+          if ($files.Count -ne 5) { throw 'Expected exactly five reviewed test files.' }
+          & $env:BOOKING_NODE --test @files
+          if ($LASTEXITCODE -ne 0) { throw 'Installed-code regression test failed.' }
+          Write-Output 'Unix-only signaled-database test is intentionally skipped on Windows; real CRUD/restore tests must run.'
+      - name: Normal user-directory CRUD, restart, backup and restore
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = $env:BOOKING_INSTALLED_ROOT
+          $app = $env:BOOKING_APP
+          $node = $env:BOOKING_NODE
+          $menu = Join-Path $app 'windows\menu.ps1'
+          $controller = Join-Path $app 'windows\controller.cjs'
+          function Menu([string]$action) {
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $menu -Action $action -NoGui
+            if ($LASTEXITCODE -ne 0) { throw "Menu $action failed." }
+          }
+          function Api([string]$route, [string]$method='GET', $body=$null) {
+            $options = @{Uri="http://127.0.0.1:17880/api/$route";Method=$method;TimeoutSec=15}
+            if ($null -ne $body) { $options.ContentType='application/json';$options.Body=($body | ConvertTo-Json -Depth 12 -Compress) }
+            Invoke-RestMethod @options
+          }
+          function Check([bool]$condition,[string]$message) { if (!$condition) { throw $message } }
+          try {
+            Menu 'start'
+            $empty = @(Api 'customers')
+            Check ($empty.Count -eq 0) 'Initial customer database is not empty.'
+            $config = Api 'config'
+            Check (!$config.demo -and !$config.readOnly) 'Installed system is not real writable LAN mode.'
+            foreach ($entry in @(@{port=17880;exe=$node},@{port=17881;exe=$env:BOOKING_MONGOD})) {
+              $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $entry.port)
+              Check ($listeners.Count -gt 0) 'Expected listening process missing.'
+              foreach ($listener in $listeners) {
+                $ownedProcessId = $listener.OwningProcess
+                $process = Get-CimInstance Win32_Process -Filter "ProcessId = $ownedProcessId"
+                Check ($process.ExecutablePath -eq $entry.exe) 'Process is using a global or unrelated runtime.'
+                if ($entry.port -eq 17881) { Check ($listener.LocalAddress -eq '127.0.0.1') 'Database exposed beyond loopback.' }
+              }
+            }
+            $duplicate = Start-Process $node -ArgumentList ('"'+$controller+'" run') -Wait -PassThru -RedirectStandardOutput (Join-Path $env:RUNNER_TEMP 'duplicate-out.txt') -RedirectStandardError (Join-Path $env:RUNNER_TEMP 'duplicate-error.txt')
+            Check ($duplicate.ExitCode -eq 1) 'Duplicate startup should refuse the second controller.'
+            $customer = Api 'customers' 'POST' @{name='CI synthetic customer';phone='000'}
+            [void](Api "customers/$($customer._id)" 'PUT' @{name='CI persisted customer'})
+            $disposable = Api 'customers' 'POST' @{name='CI delete fixture';phone='000'}
+            [void](Api "customers/$($disposable._id)" 'DELETE')
+            Check (@(Api 'customers').Count -eq 1) 'Customer create/delete result mismatch.'
+            $product = Api 'products' 'POST' @{name='CI base';type='base';inventory=@{current=20}}
+            $combo = Api 'products' 'POST' @{name='CI combo';type='combo';components=@(@{productId=$product._id;quantity=2})}
+            $order = Api 'orders' 'POST' @{customerId=$customer._id;items=@(@{productId=$combo._id;quantity=3});totalAmount=30}
+            $shipment = Api 'shipments' 'POST' @{orderId=$order._id;shippedItems=@(@{productId=$combo._id;quantity=1})}
+            Check (![string]::IsNullOrWhiteSpace($shipment._id)) 'Shipment creation failed.'
+            Check ((Api "products/$($product._id)").inventory.current -eq 18) 'Shipment stock decrement mismatch.'
+            $before = Get-Content (Join-Path $root 'active.json') -Raw | ConvertFrom-Json
+            Menu 'stop'
+            Menu 'start'
+            Check ((Api "customers/$($customer._id)").customer.name -eq 'CI persisted customer') 'Process restart lost customer data.'
+            Check (@((Api "orders/$($order._id)").shipments).Count -eq 1) 'Process restart lost shipment data.'
+            $backupOutput = & $node $controller backup
+            if ($LASTEXITCODE -ne 0) { throw 'Backup failed.' }
+            $backup = ($backupOutput | Out-String).Trim()
+            Check (Test-Path (Join-Path $backup 'manifest.json')) 'Backup manifest missing.'
+            Check ((Get-Content (Join-Path $root 'state.json') -Raw | ConvertFrom-Json).phase -eq 'stopped') 'Backup did not stop the service.'
+            Menu 'start'
+            [void](Api "customers/$($customer._id)" 'PUT' @{name='CI changed after backup'})
+            Menu 'stop'
+            & $node $controller restore $backup --confirmed
+            if ($LASTEXITCODE -ne 0) { throw 'Restore failed.' }
+            $after = Get-Content (Join-Path $root 'active.json') -Raw | ConvertFrom-Json
+            Check ($after.generation -ne $before.generation) 'Restore overwrote the original generation.'
+            Check (Test-Path (Join-Path $root "generations\$($before.generation)\WiredTiger")) 'Original generation was removed.'
+            Menu 'start'
+            Check ((Api "customers/$($customer._id)").customer.name -eq 'CI persisted customer') 'Backup restore did not recover customer value.'
+            Check (@((Api "orders/$($order._id)").shipments).Count -eq 1) 'Restore lost shipment data.'
+            Check ((Api "products/$($product._id)").inventory.current -eq 18) 'Restore lost stock state.'
+            Menu 'stop'
+            Menu 'stop'
+            Check (@(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -in @(17880,17881) }).Count -eq 0) 'Owned listeners remain after stop.'
+            Write-Output 'PASS: empty DB, installed runtimes, loopback DB, duplicate refusal, customer CRUD, order/shipment, stock, process restart, cold backup and non-overwriting restore.'
+            'Windows Server 2022 x64 automated exact-package validation passed. Win11 GUI/UAC/real LAN acceptance remains pending.' | Out-File $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          } finally {
+            & $node $controller stop
+            if ($LASTEXITCODE -ne 0) { Write-Warning 'Cleanup stop failed; inspect job logs.' }
+          }
+      - name: Failure diagnostics and owned-process cleanup
+        if: always()
+        run: |
+          $ErrorActionPreference = 'Continue'
+          if ($env:BOOKING_NODE -and (Test-Path $env:BOOKING_NODE)) {
+            & $env:BOOKING_NODE (Join-Path $env:BOOKING_APP 'windows\controller.cjs') stop
+          }
+          if ($env:BOOKING_INSTALLED_ROOT) {
+            Get-ChildItem (Join-Path $env:BOOKING_INSTALLED_ROOT 'logs') -Filter '*.log' -ErrorAction SilentlyContinue | ForEach-Object {
+              Write-Output "Diagnostic log: $($_.Name)"
+              Get-Content $_.FullName -Tail 15
+            }
+          }
+          Write-Output 'No Actions artifact/cache upload; no deployment or release; test data exists only on this ephemeral runner.'
